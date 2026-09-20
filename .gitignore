@@ -1,0 +1,50 @@
+# ─── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Virtual envs ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Build artifacts ────────────────────────────────────────────────────
+build/
+dist/
+*.spec.bak
+*.app
+.idea/
+.vscode/
+
+# ─── macOS junk ─────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon
+.Spotlight-V100
+.Trashes
+
+# ─── App-specific junk ──────────────────────────────────────────────────
+# Stray tmux logs from earlier debugging
+*.log
+# TUI agent session captures
+tmux-client-*.log
+tmux-server-*.log
+
+# ─── OS preferences (don't commit user QSettings) ──────────────────────
+*.plist
+!Info.plist
+
+# ─── Temp / local ───────────────────────────────────────────────────────
+tmp/
+.tmp/
+.cache/
