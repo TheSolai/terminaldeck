@@ -64,6 +64,12 @@ class TabbedTerminal(QTabWidget):
         self._close_icon = make_close_icon("#7d8590", 14)
         self._close_icon_hover = make_close_icon("#f85149", 14)
 
+        # Notify MainWindow when tabs are added/removed so the title bar
+        # running-count can be re-evaluated. QTabWidget has no built-in
+        # tabInserted/tabRemoved signals, so we hook currentChanged (fires
+        # when a tab becomes current after add/remove/select).
+        self.currentChanged.connect(lambda *_: self.tab_state_changed.emit())
+
         self.setStyleSheet(f"""
             QTabWidget::pane {{
                 border: 1px solid #21262d;
@@ -219,8 +225,37 @@ class TabbedTerminal(QTabWidget):
 
     def close_current(self):
         idx = self.currentIndex()
+        if idx < 0:
+            # currentIndex is invalid (no tab) — fall back to last tab
+            idx = self.count() - 1
         if idx >= 0 and self.count() > 1:
             self._on_close_requested(idx)
+
+    def duplicate_current(self):
+        """Duplicate the current tab's command into a new tab (⌘D)."""
+        idx = self.currentIndex()
+        if idx < 0:
+            return
+        st = self._tab_states.get(idx, {})
+        cmd = st.get("command")
+        cat = st.get("category", "default")
+        if cmd:
+            self.run_in_new_tab(cmd, category=cat)
+        else:
+            # No command yet — just open an empty tab
+            self.new_tab()
+
+    def restart_current(self):
+        """Re-run the current tab's last command (⌘R when in pane)."""
+        idx = self.currentIndex()
+        if idx < 0:
+            return
+        st = self._tab_states.get(idx, {})
+        cmd = st.get("command")
+        cat = st.get("category", "default")
+        term = self.current_terminal()
+        if cmd and term:
+            term.run(cmd)
 
     def switch_to_tab(self, n: int):
         """Switch to tab N (1-indexed). Cmd-1..Cmd-9."""
@@ -330,12 +365,24 @@ class TabbedTerminal(QTabWidget):
     def _refresh_tab_title(self, idx: int):
         st = self._tab_states.get(idx, {})
         cmd = st.get("command")
+        cat = st.get("category", "default")
         if not cmd:
             self.setTabText(idx, f"Terminal {idx + 1}")
             self.setTabIcon(idx, QIcon())
             return
+        # Show "tool · cmd" if category looks like a tool id; otherwise just cmd
+        # (Many launches go through run_in_new_tab with category=tool.category)
+        # Use the first word of cmd as a friendly short name
+        first_word = cmd.split()[0] if cmd else "?"
+        # Strip path
+        short_tool = first_word.split("/")[-1] if "/" in first_word else first_word
+        if short_tool != cmd and len(cmd) > len(short_tool) + 1:
+            label = f"{short_tool}  ·  {cmd[len(short_tool)+1:].strip()}"
+        else:
+            label = cmd
         # Truncate
-        label = cmd if len(cmd) <= 24 else cmd[:21] + "…"
+        if len(label) > 28:
+            label = label[:25] + "…"
         # Add exit status badge
         if st.get("state") == "done":
             code = st.get("exit")
@@ -436,8 +483,20 @@ class TabbedTerminal(QTabWidget):
             QShortcut(QKeySequence(f"Ctrl+{n}"), self, activated=lambda x=n: self.switch_to_tab(x))
 
     def shutdown(self):
-        """Stop all running tabs cleanly before app quit."""
-        for i in range(self.count()):
+        """Stop all running tabs cleanly before app quit.
+
+        For each tab with a live process: send SIGINT, then wait for the
+        reader thread to exit (with a hard cap). We process sequentially so
+        the GUI doesn't get spammed with simultaneous close signals."""
+        # Walk backwards so closing tabs doesn't shift indices mid-loop
+        for i in range(self.count() - 1, -1, -1):
             w = self.widget(i)
-            if isinstance(w, TerminalDeckWidget) and w.pane.master_fd is not None:
-                w.pane.stop()
+            if isinstance(w, TerminalDeckWidget):
+                if w.pane.master_fd is not None:
+                    # Hard kill on shutdown — we want a fast, clean exit.
+                    # SIGINT doesn't always work for stubborn TUIs; SIGKILL
+                    # is fine here because the whole app is going down.
+                    w.pane.kill()
+                # Always call _cleanup so the reader thread exits even if
+                # the process was already dead.
+                w.pane._cleanup()

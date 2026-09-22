@@ -308,15 +308,29 @@ def t9_polish() -> None:
     else:
         record(WARN, "T9", f"nativeMenuBar=False (offscreen mode disables it; production .app will have it)")
 
-    # Standard Mac shortcuts wired up
+    # Standard Mac shortcuts wired up — count BOTH menu shortcuts AND window-action shortcuts
     shortcut_count = 0
-    expected = ["Meta+F", "Meta+T", "Meta+K", "Meta+C", "Meta+=", "Meta+-", "Meta+0",
-                "Meta+Return", "Meta+Shift+Return", "Meta+Q", "Meta+,"]
+    seen = set()
+    # Menu traversal
+    def walk_menu(menu):
+        for a in menu.actions():
+            if a.menu():
+                walk_menu(a.menu())
+            else:
+                seq = a.shortcut().toString()
+                if seq:
+                    seen.add(seq)
+    walk_menu(win.menuBar())
+    # Direct window actions
     for action in win.actions():
         seq = action.shortcut().toString()
-        if any(s in seq for s in ["Meta+", "Ctrl+R"]):
-            shortcut_count += 1
-    record(PASS, "T9", f"{shortcut_count} keyboard shortcuts registered (incl. ⌘F/T/K/C/Q/, etc.)")
+        if seq:
+            seen.add(seq)
+    shortcut_count = len(seen)
+    new_shortcuts = {"Meta+W", "Meta+D", "Meta+Shift+R", "Meta+/"}
+    has_new = new_shortcuts & seen
+    record(PASS if len(has_new) == 4 else FAIL, "T9",
+           f"{shortcut_count} shortcuts total; new (⌘W/⌘D/⌘⇧R/⌘/) present: {len(has_new)}/4")
 
     # Rich tooltips on tool rows
     app.processEvents()
@@ -343,6 +357,132 @@ def t9_polish() -> None:
     key = s.value("selected_key", "")
     record(PASS if sec == "installed" and key == "ai-coding" else FAIL, "T9",
            f"QSettings persisted: section={sec}, key={key}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# T10 — Stability/QoL improvements (TM only — uses TabbedTerminal, not MainWindow)
+# ─────────────────────────────────────────────────────────────────────────
+def t10_stability_qol() -> None:
+    print("\n══ T10: Stability + QoL improvements ══")
+    from PySide6.QtWidgets import QApplication
+    from terminaldeck.tabbed import TabbedTerminal
+    from terminaldeck.terminal import TerminalDeckWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    t = TabbedTerminal()
+    t.show()
+    app.processEvents()
+
+    # Tab action methods exist
+    record(PASS if hasattr(t, "close_current") else FAIL, "T10",
+           "TabbedTerminal.close_current exists")
+    record(PASS if hasattr(t, "duplicate_current") else FAIL, "T10",
+           "TabbedTerminal.duplicate_current exists")
+    record(PASS if hasattr(t, "restart_current") else FAIL, "T10",
+           "TabbedTerminal.restart_current exists")
+
+    # Add a tab with faked state (no real subprocess)
+    initial_count = t.count()
+    fake_term = TerminalDeckWidget()
+    idx = t.addTab(fake_term, "fake")
+    # NOTE: leave command empty so duplicate_current opens an EMPTY tab,
+    # not a real PTY (which would hang in offscreen mode)
+    t._tab_states[idx] = {
+        "state": "done", "exit": 0,
+        "command": None,
+        "category": "test-cat",
+    }
+    record(PASS if t.count() == initial_count + 1 else FAIL, "T10",
+           f"addTab works: {initial_count} → {t.count()} tabs")
+
+    # Switch + duplicate (should open empty tab, not spawn subprocess)
+    t.setCurrentIndex(idx)
+    t.duplicate_current()
+    record(PASS if t.count() == initial_count + 2 else FAIL, "T10",
+           f"duplicate_current: count={t.count()}")
+
+    # Verify duplicate tab was opened (idle, no command)
+    new_idx = t.currentIndex()
+    record(PASS if t.count() == initial_count + 2 else FAIL, "T10",
+           f"duplicated tab exists: count={t.count()}, current={new_idx}")
+
+    # restart_current on idle tab — must not raise
+    t.restart_current()
+    record(PASS, "T10", "restart_current on idle tab does not crash")
+
+    # Close the duplicate, then the original
+    t.close_current()
+    record(PASS if t.count() == initial_count + 1 else FAIL, "T10",
+           f"close_current removes duplicated → count={t.count()}")
+    t.close_current()
+    record(PASS if t.count() == initial_count else FAIL, "T10",
+           f"close_current removes original → count={t.count()}")
+
+    # _cleanup idempotency
+    pane = t.widget(0).pane
+    pane._cleanup()
+    try:
+        pane._cleanup()
+        record(PASS, "T10", "_cleanup is idempotent")
+    except Exception as e:
+        record(FAIL, "T10", f"_cleanup not idempotent: {e}")
+
+    # shutdown() on populated TabbedTerminal
+    try:
+        t.shutdown()
+        record(PASS, "T10", "shutdown() runs without crash")
+    except Exception as e:
+        record(FAIL, "T10", f"shutdown() crashed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# T11 — Tab title format (shows tool name + command)
+# ─────────────────────────────────────────────────────────────────────────
+def t11_tab_title() -> None:
+    print("\n══ T11: Tab title format ══")
+    from PySide6.QtWidgets import QApplication
+    from terminaldeck.tabbed import TabbedTerminal
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    t = TabbedTerminal()
+    t.show()
+    app.processEvents()
+
+    # Simulate running a known command
+    idx = 0
+    t._tab_states[idx] = {
+        "state": "running", "exit": None,
+        "command": "claude chat",
+        "category": "ai-coding",
+    }
+    t._refresh_tab_title(idx)
+    title = t.tabText(idx)
+    record(PASS if "claude" in title and "chat" in title else FAIL, "T11",
+           f"tab title contains tool + cmd: {title!r}")
+
+    # Mark done with exit 0 — should add ✓ badge
+    t._tab_states[idx]["state"] = "done"
+    t._tab_states[idx]["exit"] = 0
+    t._refresh_tab_title(idx)
+    title2 = t.tabText(idx)
+    record(PASS if "✓" in title2 else FAIL, "T11",
+           f"done state adds ✓ badge: {title2!r}")
+
+    # Mark done with non-zero exit — should add ✗N badge
+    t._tab_states[idx]["exit"] = 127
+    t._refresh_tab_title(idx)
+    title3 = t.tabText(idx)
+    record(PASS if "✗127" in title3 else FAIL, "T11",
+           f"non-zero exit shows ✗N: {title3!r}")
+
+    # Long command should be truncated with …
+    t._tab_states[idx]["command"] = "kubectl get pods --all-namespaces -o yaml | less"
+    t._tab_states[idx]["state"] = "running"
+    t._tab_states[idx]["exit"] = None
+    t._refresh_tab_title(idx)
+    title4 = t.tabText(idx)
+    record(PASS if "…" in title4 else FAIL, "T11",
+           f"long command truncated: {title4!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -379,6 +519,8 @@ def main() -> int:
     t6_search()
     t7_launcher()
     t9_polish()
+    t10_stability_qol()
+    t11_tab_title()
 
     print("\n" + "═" * 60)
     n_pass = sum(1 for s, _, _ in results if s == PASS)

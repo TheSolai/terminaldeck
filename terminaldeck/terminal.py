@@ -218,6 +218,7 @@ class TerminalPane(QPlainTextEdit):
         # State
         self.master_fd: int | None = None
         self.child_pid: int | None = None
+        self._last_pid_for_reap: int | None = None
         self.reader: PTYReader | None = None
 
         # pyte screen + stream. HistoryScreen holds scrollback. cols=120,
@@ -305,6 +306,7 @@ class TerminalPane(QPlainTextEdit):
 
         # Parent
         self.child_pid = pid
+        self._last_pid_for_reap = pid
         self.master_fd = fd
 
         # Reset pyte screen for fresh run
@@ -386,6 +388,16 @@ class TerminalPane(QPlainTextEdit):
                 pass
 
     def _cleanup(self):
+        """Idempotent cleanup: safe to call multiple times.
+
+        Order matters:
+          1. Close master fd — this unblocks the reader's select() immediately
+             so the reader thread can exit on its own.
+          2. Tell the reader to stop (no-op if already exiting).
+          3. Wait up to 1.5s for the thread to exit cleanly; if it doesn't,
+             terminate it (SIGTERM via Qt, not OS kill).
+          4. Non-blocking reap of the child (in case it's a zombie).
+        """
         # Close fd first — unblocks the reader's select() immediately
         if self.master_fd is not None:
             try:
@@ -394,17 +406,28 @@ class TerminalPane(QPlainTextEdit):
                 pass
             self.master_fd = None
         if self.reader is not None:
-            self.reader.stop()
-            if not self.reader.wait(1500):
-                self.reader.terminate()
-                self.reader.wait(500)
+            try:
+                self.reader.stop()
+            except Exception:
+                pass
+            try:
+                if not self.reader.wait(1500):
+                    # Reader is stuck — terminate forcefully
+                    self.reader.terminate()
+                    self.reader.wait(500)
+            except Exception:
+                pass
             self.reader = None
         if self.child_pid is not None:
-            # Reap the zombie
+            # Reap the zombie (non-blocking)
             try:
                 os.waitpid(self.child_pid, os.WNOHANG)
             except ChildProcessError:
                 pass
+            except OSError:
+                pass
+            # Don't clear child_pid — _reap_zombie needs it later if needed
+            # But clear it here to avoid double-waitpid
             self.child_pid = None
 
     # ─── Output handling ───────────────────────────────────────────────
@@ -431,7 +454,7 @@ class TerminalPane(QPlainTextEdit):
         timer fires, and any code reading toPlainText() right after sees
         stale content.
         """
-        # Reap the child to get the real exit code
+        # Reap the child to get the real exit code (non-blocking)
         rc = 0
         try:
             pid, status = os.waitpid(self.child_pid or 0, os.WNOHANG)
@@ -453,9 +476,38 @@ class TerminalPane(QPlainTextEdit):
         self._dirty = False
         self._render_screen()
 
+        # Schedule cleanup + signal emission so this slot returns quickly.
+        # Trying to waitpid synchronously here blocks the GUI thread when
+        # the child hasn't exited yet (race with _cleanup). Defer to a
+        # one-shot timer.
+        QTimer.singleShot(0, lambda: self._finalize_close(rc))
+
+    def _finalize_close(self, rc: int):
+        """Run cleanup + emit exit signals on next event-loop tick.
+
+        Splitting this out of _on_closed prevents re-entrancy issues if
+        _cleanup() tries to wait on the reader while the reader is still
+        finishing up."""
         self._cleanup()
         self.state_changed.emit("")
         self.process_exited.emit(rc)
+
+        # Schedule a final zombie reaper in case _cleanup's WNOHANG missed
+        # the child. We do this in a delayed timer so the GUI keeps
+        # responsive.
+        if self.child_pid is None and self._last_pid_for_reap:
+            QTimer.singleShot(200, self._reap_zombie)
+
+    def _reap_zombie(self):
+        """Background zombie reaper for any lingering child."""
+        pid = self._last_pid_for_reap
+        if pid is None:
+            return
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+        self._last_pid_for_reap = None
 
     def _on_repaint_tick(self):
         """Coalesced repaint — runs at 30 fps, only does work if data arrived."""

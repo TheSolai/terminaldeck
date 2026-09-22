@@ -656,6 +656,7 @@ class MainWindow(QMainWindow):
 
         # Toolbar
         tb = QToolBar()
+        tb.setObjectName("MainToolBar")  # required for saveState() / restoreState()
         tb.setMovable(False)
         self.addToolBar(tb)
 
@@ -1049,6 +1050,18 @@ class MainWindow(QMainWindow):
         new_tab.setShortcut(QKeySequence("Meta+T"))
         new_tab.triggered.connect(lambda: self.terminal.new_tab())
         file_menu.addAction(new_tab)
+        close_tab = QAction("Close Tab", self)
+        close_tab.setShortcut(QKeySequence("Meta+W"))
+        close_tab.triggered.connect(self.terminal.close_current)
+        file_menu.addAction(close_tab)
+        duplicate_tab = QAction("Duplicate Tab", self)
+        duplicate_tab.setShortcut(QKeySequence("Meta+D"))
+        duplicate_tab.triggered.connect(self.terminal.duplicate_current)
+        file_menu.addAction(duplicate_tab)
+        restart_tab = QAction("Restart Current Tab", self)
+        restart_tab.setShortcut(QKeySequence("Meta+Shift+R"))
+        restart_tab.triggered.connect(self.terminal.restart_current)
+        file_menu.addAction(restart_tab)
         file_menu.addSeparator()
         refresh = QAction("Re-detect Tools", self)
         refresh.setShortcut(QKeySequence("Ctrl+R"))
@@ -1090,6 +1103,13 @@ class MainWindow(QMainWindow):
         win_menu = menubar.addMenu("Window")
         # Qt's Mac standard "Minimize / Zoom" appear automatically
 
+        # ─── Help menu ──────────────────────────────────────────────
+        help_menu = menubar.addMenu("Help")
+        shortcuts_act = QAction("Keyboard Shortcuts", self)
+        shortcuts_act.setShortcut(QKeySequence("Meta+/"))
+        shortcuts_act.triggered.connect(self._show_shortcuts)
+        help_menu.addAction(shortcuts_act)
+
     def _show_about(self):
         """Show a native About dialog."""
         from PySide6.QtWidgets import QMessageBox
@@ -1112,6 +1132,36 @@ class MainWindow(QMainWindow):
             "<p>TerminalDeck remembers your last selected category "
             "and filter between launches.</p>"
             "<p style='color:#888'>More settings coming soon.</p>",
+        )
+
+    def _show_shortcuts(self):
+        """Native dialog showing every keyboard shortcut."""
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.information(
+            self,
+            "Keyboard Shortcuts",
+            """<h3>Keyboard Shortcuts</h3>
+<table cellpadding='6' style='margin-top:8px'>
+<tr><td><b>⌘F</b></td><td>Focus filter</td></tr>
+<tr><td><b>Esc</b></td><td>Clear filter & unfocus</td></tr>
+<tr><td><b>⌘T</b></td><td>New tab</td></tr>
+<tr><td><b>⌘W</b></td><td>Close current tab</td></tr>
+<tr><td><b>⌘D</b></td><td>Duplicate current tab</td></tr>
+<tr><td><b>⌘⇧R</b></td><td>Restart current tab's command</td></tr>
+<tr><td><b>⌘Return</b></td><td>Launch selected tool</td></tr>
+<tr><td><b>⌘⇧Return</b></td><td>Launch selected tool in new tab</td></tr>
+<tr><td><b>⌘1 … ⌘9</b></td><td>Switch to tab N</td></tr>
+<tr><td><b>⌘K</b></td><td>Clear terminal</td></tr>
+<tr><td><b>⌘C</b></td><td>Stop current process</td></tr>
+<tr><td><b>⌘=</b> / <b>⌘-</b> / <b>⌘0</b></td><td>Font +/−/reset</td></tr>
+<tr><td><b>Ctrl+R</b></td><td>Re-detect tools</td></tr>
+<tr><td><b>⌘,</b></td><td>Preferences</td></tr>
+<tr><td><b>⌘Q</b></td><td>Quit TerminalDeck</td></tr>
+</table>
+<p style='color:#888;margin-top:12px'>
+Right-click a tool row for Terminal.app / Warp launch.<br>
+Click a tool row to launch in the current tab.
+</p>""",
         )
 
     def _launch_selected(self):
@@ -1145,7 +1195,7 @@ class MainWindow(QMainWindow):
 
     # ─── QSettings persistence ────────────────────────────────────────
     def _restore_session(self):
-        """Restore last selected category + filter from QSettings."""
+        """Restore last selected category + filter + window geometry from QSettings."""
         from PySide6.QtCore import QSettings
         s = QSettings("TheSolAI", "TerminalDeck")
         cat_section = s.value("selected_section", "installed")
@@ -1160,6 +1210,31 @@ class MainWindow(QMainWindow):
         # Restore available_only toggle
         avail = s.value("available_only", False, bool)
         self.available_only.setChecked(avail)
+        # Restore window geometry (size + position)
+        geom = s.value("window_geometry")
+        if geom is not None:
+            try:
+                self.restoreGeometry(geom)
+            except Exception:
+                pass
+        state = s.value("window_state")
+        if state is not None:
+            try:
+                self.restoreState(state)
+            except Exception:
+                pass
+        # Restore splitter sizes
+        sp = s.value("splitter_sizes")
+        if sp is not None:
+            try:
+                # PySide6 returns a QByteArray; convert to int list
+                if hasattr(sp, "toList"):
+                    sp = sp.toList()
+                sizes = [int(x) for x in sp]
+                if len(sizes) == 3 and sum(sizes) > 0:
+                    self.splitter.setSizes(sizes)
+            except Exception:
+                pass
         # Highlight matching sidebar row
         for i, (sec, key, item) in enumerate(self.sidebar._items):
             if sec == cat_section and key == cat_key:
@@ -1167,7 +1242,7 @@ class MainWindow(QMainWindow):
                 break
 
     def _save_session(self):
-        """Persist last selected category + filter to QSettings."""
+        """Persist last selected category + filter + geometry to QSettings."""
         from PySide6.QtCore import QSettings
         s = QSettings("TheSolAI", "TerminalDeck")
         section, key = self._selected_category
@@ -1175,6 +1250,13 @@ class MainWindow(QMainWindow):
         s.setValue("selected_key", key)
         s.setValue("filter_text", self.filter.text())
         s.setValue("available_only", self.available_only.isChecked())
+        # Save window geometry
+        try:
+            s.setValue("window_geometry", self.saveGeometry())
+            s.setValue("window_state", self.saveState())
+            s.setValue("splitter_sizes", self.splitter.sizes())
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         """Make sure all PTYReader threads are fully stopped before exit."""
