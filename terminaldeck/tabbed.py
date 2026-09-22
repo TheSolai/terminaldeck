@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QKeySequence, QShortcut, QFont
 from PySide6.QtWidgets import (
@@ -10,6 +11,18 @@ from PySide6.QtWidgets import (
 )
 
 from .terminal import TerminalDeckWidget
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds as '1.2s' / '2m 15s' / '1h 23m'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {s}s"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m}m"
 
 
 # ─── Icon helpers ──────────────────────────────────────────────────────
@@ -180,6 +193,8 @@ class TabbedTerminal(QTabWidget):
             "exit": None,         # exit code when done
             "command": None,      # last command run
             "category": "default", # category for color tint
+            "started_at": None,   # unix timestamp when command started
+            "finished_at": None,  # unix timestamp when command finished
         }
         self._set_close_icon(idx)
         self._update_tab_tooltip(idx)
@@ -335,6 +350,7 @@ class TabbedTerminal(QTabWidget):
         st = self._tab_states.get(idx, {})
         st["state"] = "done"
         st["exit"] = code
+        st["finished_at"] = time.time()
         self._refresh_tab_title(idx)
         self._update_tab_tooltip(idx)
         self.tab_state_changed.emit()
@@ -349,6 +365,8 @@ class TabbedTerminal(QTabWidget):
             st["command"] = command
             st["state"] = "running"
             st["exit"] = None
+            st["started_at"] = time.time()
+            st["finished_at"] = None
         # When command becomes empty (process ended), DON'T clobber state or
         # command — _on_tab_exit will set state="done" + exit code, and we
         # want the command to persist so the ✓/✗N badge renders in the title.
@@ -449,11 +467,20 @@ class TabbedTerminal(QTabWidget):
         if st.get("state") == "done":
             code = st.get("exit")
             parts.append(f"exit: {code if code is not None else '?'}")
+            # Show runtime if we know both timestamps
+            start = st.get("started_at")
+            end = st.get("finished_at")
+            if start and end and end >= start:
+                parts.append(f"ran for {_format_duration(end - start)}")
+        elif st.get("state") == "running":
+            start = st.get("started_at")
+            if start:
+                parts.append(f"running for {_format_duration(time.time() - start)}")
         widget = self.widget(idx)
         if isinstance(widget, TerminalDeckWidget) and widget.pane.child_pid:
             parts.append(f"PID: {widget.pane.child_pid}")
         parts.append("Double-click or × to close")
-        parts.append("⌘1–⌘9 to switch · ⌘T new · ⌘W close · ⌘K clear · ⌘± font")
+        parts.append("⌘1–⌘9 switch · ⌘T new · ⌘W close · ⌘K clear · ⌘± font · ⌘D dup · ⌘⇧R restart")
         self.setTabToolTip(idx, "\n".join(parts))
 
     def _set_close_icon(self, idx: int):

@@ -199,10 +199,28 @@ class TerminalPane(QPlainTextEdit):
         self.customContextMenuRequested.connect(self._show_context_menu)
         self.setMaximumBlockCount(10_000)  # hard cap on lines retained
 
+        # Set hard-coded defaults first so the prefs block below can reference them.
+        self._cols, self._rows = 120, 40
+
+        # Load font size / cols / rows from QSettings so user prefs apply.
+        from PySide6.QtCore import QSettings
+        s = QSettings("TheSolAI", "TerminalDeck")
         font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-        font.setPointSize(12)
+        try:
+            font.setPointSize(int(s.value("default_font_size", 12)))
+        except (TypeError, ValueError):
+            font.setPointSize(12)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(font)
+
+        # Override default cols/rows with user prefs (used by pyte screen + TIOCSWINSZ)
+        try:
+            self._cols = int(s.value("default_cols", self._cols))
+            self._rows = int(s.value("default_rows", self._rows))
+            self._screen = pyte.HistoryScreen(self._cols, self._rows)
+            self._stream = pyte.Stream(self._screen)
+        except (TypeError, ValueError):
+            pass
 
         self.setStyleSheet("""
             QPlainTextEdit {
@@ -221,11 +239,12 @@ class TerminalPane(QPlainTextEdit):
         self._last_pid_for_reap: int | None = None
         self.reader: PTYReader | None = None
 
-        # pyte screen + stream. HistoryScreen holds scrollback. cols=120,
-        # rows=40 (pyte will resize on TIOCSWINSZ ioctl if we update it).
-        self._cols, self._rows = 120, 40
-        self._screen = pyte.HistoryScreen(self._cols, self._rows)
-        self._stream = pyte.Stream(self._screen)
+        # pyte screen + stream (defaults set earlier in __init__ from prefs;
+        # this block remains as a fallback if QSettings had no prefs).
+        if not hasattr(self, "_screen") or self._screen is None:
+            self._cols, self._rows = 120, 40
+            self._screen = pyte.HistoryScreen(self._cols, self._rows)
+            self._stream = pyte.Stream(self._screen)
 
         # Render coalescing: data → _dirty=True, repaint timer drains it
         self._dirty = False

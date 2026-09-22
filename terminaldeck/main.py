@@ -26,19 +26,81 @@ from .launcher import ExternalLauncher
 
 class DetectionSignals(QObject):
     done = Signal(dict)  # {tool_id: status_dict}
+    progress = Signal(int, int)  # (current, total)
 
 
 class DetectionWorker(QRunnable):
     def __init__(self):
         super().__init__()
         self.signals = DetectionSignals()
+        self._cancelled = False
+
+    def cancel(self):
+        """Mark for cancellation. Safe to call from any thread."""
+        self._cancelled = True
 
     @Slot()
     def run(self):
-        # Detect both installed and discover tools in one pass
-        all_tools = T.all_tools()
-        results = T.detect_all(all_tools)
-        self.signals.done.emit(results)
+        """Run detection with cancellation + parallel execution + exception safety.
+
+        The previous version could raise `RuntimeError: cannot schedule new
+        futures after interpreter shutdown` if the QApplication was
+        destroyed mid-detection. Now we:
+          1. Use a LOCAL ThreadPoolExecutor (not the global one) — local pools
+             are cleaned up via context manager, so no global state pollution.
+          2. Catch all per-tool exceptions so a single broken tool can't kill
+             the whole run.
+          3. Honour self._cancelled (set by MainWindow on shutdown) — checked
+             between batch dispatches.
+          4. Emit progress every 10 tools.
+        """
+        try:
+            tools = T.all_tools()
+            total = len(tools)
+            results: dict[str, dict] = {}
+
+            # Use a local executor we control — its lifetime is this function.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            try:
+                with ThreadPoolExecutor(max_workers=16) as ex:
+                    future_to_tool = {ex.submit(T.detect, t): t for t in tools}
+                    done_count = 0
+                    for future in as_completed(future_to_tool):
+                        if self._cancelled:
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            break
+                        tool = future_to_tool[future]
+                        try:
+                            results[tool.id] = future.result()
+                        except Exception as e:
+                            results[tool.id] = {
+                                "available": False, "version": None,
+                                "path": None, "error": str(e),
+                            }
+                        done_count += 1
+                        if done_count % 10 == 0 or done_count == total:
+                            try:
+                                self.signals.progress.emit(done_count, total)
+                            except RuntimeError:
+                                pass
+            except RuntimeError:
+                # Pool couldn't start — fall back to serial
+                for i, tool in enumerate(tools):
+                    if self._cancelled:
+                        break
+                    try:
+                        results[tool.id] = T.detect(tool)
+                    except Exception as e:
+                        results[tool.id] = {"available": False, "version": None, "path": None, "error": str(e)}
+
+            try:
+                self.signals.done.emit(results)
+            except RuntimeError:
+                # C++ object already deleted — main window already gone.
+                pass
+        except Exception:
+            # Last-ditch: don't crash the worker thread
+            pass
 
 
 # ─── Tool list widget ──────────────────────────────────────────────────
@@ -479,10 +541,19 @@ class Sidebar(QWidget):
 
         # Items
         self._items: list[tuple[str, str | None, QListWidgetItem]] = []
+        # Category icons — short labels that fit before the count
+        cat_icons = {
+            "ai-coding": "🤖", "openclaw": "🦅", "local-llm": "🧠",
+            "local-ai": "⚡", "productivity": "✨", "dev": "🔧",
+            "shell": "🐚", "editors": "📝", "network": "🌐", "k8s": "⎈",
+            "cloud": "☁️", "db": "🗄", "build": "🏗", "system": "💻",
+            "fun": "🎲", "misc": "📦",
+        }
         # section="installed"
         for cat_key, cat_title in T.CATEGORIES:
             count = sum(1 for t in T.TOOLS if t.category == cat_key)
-            label = f"{cat_title}  ({count})" if cat_key is None else f"{cat_title}  ({count})"
+            icon = cat_icons.get(cat_key, "")
+            label = f"{icon} {cat_title}  ({count})" if icon else f"{cat_title}  ({count})"
             item = QListWidgetItem(label)
             self.list.addItem(item)
             self._items.append(("installed", cat_key, item))
@@ -499,7 +570,9 @@ class Sidebar(QWidget):
         # section="discover"
         for cat_key, cat_title in T.DISCOVER_CATEGORIES:
             count = sum(1 for t in T.DISCOVER_TOOLS if t.category == cat_key)
-            item = QListWidgetItem(f"{cat_title}  ({count})")
+            icon = cat_icons.get(cat_key, "")
+            label = f"{icon} {cat_title}  ({count})" if icon else f"{cat_title}  ({count})"
+            item = QListWidgetItem(label)
             self.list.addItem(item)
             self._items.append(("discover", cat_key, item))
 
@@ -524,14 +597,63 @@ class Sidebar(QWidget):
 
     def update_counts(self, statuses: dict[str, dict]):
         """Refresh counts in sidebar based on detection results."""
+        # Build a lookup: cat → (cat_title, total, available)
+        cat_avail = {}
+        for section in ("installed", "discover"):
+            tools = T.TOOLS if section == "installed" else T.DISCOVER_TOOLS
+            cats = T.CATEGORIES if section == "installed" else T.DISCOVER_CATEGORIES
+            for cat_key, cat_title in cats:
+                total = sum(1 for t in tools if t.category == cat_key)
+                avail = sum(1 for t in tools
+                            if t.category == cat_key
+                            and statuses.get(t.id, {}).get("available"))
+                cat_avail[(section, cat_key)] = (cat_title, total, avail)
+        # Emit labels with icons + available/total
+        cat_icons = {
+            "ai-coding": "🤖", "openclaw": "🦅", "local-llm": "🧠",
+            "local-ai": "⚡", "productivity": "✨", "dev": "🔧",
+            "shell": "🐚", "editors": "📝", "network": "🌐", "k8s": "⎈",
+            "cloud": "☁️", "db": "🗄", "build": "🏗", "system": "💻",
+            "fun": "🎲", "misc": "📦",
+        }
         for i, (section, cat_key, item) in enumerate(self._items):
-            if section == "installed":
-                count = sum(1 for t in T.TOOLS if t.category == cat_key)
-                cat_title = next((t for k, t in T.CATEGORIES if k == cat_key), "All Tools")
+            cat_title, total, avail = cat_avail.get((section, cat_key), ("?", 0, 0))
+            icon = cat_icons.get(cat_key, "")
+            prefix = f"{icon} " if icon else ""
+            if avail and avail != total:
+                item.setText(f"{prefix}{cat_title}  ({avail}/{total})")
             else:
-                count = sum(1 for t in T.DISCOVER_TOOLS if t.category == cat_key)
-                cat_title = next((t for k, t in T.DISCOVER_CATEGORIES if k == cat_key), "?")
-            item.setText(f"{cat_title}  ({count})")
+                item.setText(f"{prefix}{cat_title}  ({total})")
+
+    def update_running_indicators(self, running_commands: set[str]):
+        """Show a green dot next to categories with running tools.
+
+        `running_commands` is a set of full command strings (or first-words)
+        that are currently running. We match by the tool's `command` field,
+        which is typically the first word of the launch command (e.g.
+        "claude", "codex", "ollama").
+        """
+        running_first_words = set()
+        for cmd in running_commands:
+            cmd = cmd.strip()
+            if cmd:
+                # Take first word, strip path
+                first = cmd.split()[0].split("/")[-1] if cmd else ""
+                if first:
+                    running_first_words.add(first)
+        # Also collect known running commands from tab state
+        for section, cat_key, item in self._items:
+            tools = T.TOOLS if section == "installed" else T.DISCOVER_TOOLS
+            cat_running = 0
+            for t in tools:
+                if t.category != cat_key:
+                    continue
+                tool_cmd = t.command.split("/")[-1].strip()
+                if tool_cmd in running_first_words:
+                    cat_running += 1
+            # If this category was previously marked, we'd want to update its label.
+            # We just store the count — _refresh_labels appends the dot.
+            item.setData(Qt.ItemDataRole.UserRole, cat_running)
 
     def _on_changed(self, current, _prev):
         if current is None:
@@ -792,9 +914,24 @@ class MainWindow(QMainWindow):
 
     def _run_detection(self):
         self.sidebar.set_status_text("Detecting tools…")
+        # Cancel any previous in-flight detection
+        if hasattr(self, "_worker") and self._worker is not None:
+            try:
+                self._worker.cancel()
+            except Exception:
+                pass
         worker = DetectionWorker()
+        self._worker = worker
         worker.signals.done.connect(self._on_detection_done)
+        worker.signals.progress.connect(self._on_detection_progress)
         QThreadPool.globalInstance().start(worker)
+
+    def _on_detection_progress(self, current: int, total: int):
+        """Show 'Detecting X/Y…' in status bar while detection is running."""
+        self.sidebar.set_status_text(f"Detecting {current}/{total}…")
+        # Don't spam status bar — only every 10th update
+        if current % 20 == 0 or current == total:
+            self.statusBar().showMessage(f"Detecting tools — {current}/{total}", 1000)
 
     def _on_detection_done(self, statuses: dict):
         # Split: installed tools go in _statuses, discover tools go in _discover_statuses
@@ -1123,15 +1260,103 @@ class MainWindow(QMainWindow):
         )
 
     def _show_preferences(self):
-        """Show preferences dialog. Currently a placeholder for future settings."""
-        from PySide6.QtWidgets import QMessageBox
-        QMessageBox.information(
-            self,
-            "Preferences",
-            "<h3>Preferences</h3>"
-            "<p>TerminalDeck remembers your last selected category "
-            "and filter between launches.</p>"
-            "<p style='color:#888'>More settings coming soon.</p>",
+        """Real preferences dialog with working settings.
+
+        Settings (persisted via QSettings):
+          - default_font_size: 7..32 (default 12)
+          - default_cols: 60..240 (default 120)
+          - default_rows: 20..60 (default 40)
+          - detection_timeout: 0.5..5.0s (default 1.5)
+          - show_installed_first: bool (default True)
+          - confirm_quit: bool (default True)
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+            QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton,
+            QDialogButtonBox, QLabel,
+        )
+        from PySide6.QtCore import QSettings
+
+        s = QSettings("TheSolAI", "TerminalDeck")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Preferences")
+        dlg.setMinimumWidth(420)
+
+        # ─── Form ────────────────────────────────────────────────────
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        font_size = QSpinBox()
+        font_size.setRange(7, 32)
+        font_size.setValue(s.value("default_font_size", 12, int))
+        form.addRow("Default font size:", font_size)
+
+        cols = QSpinBox()
+        cols.setRange(60, 240)
+        cols.setSingleStep(10)
+        cols.setValue(s.value("default_cols", 120, int))
+        form.addRow("Terminal columns:", cols)
+
+        rows = QSpinBox()
+        rows.setRange(20, 60)
+        rows.setSingleStep(2)
+        rows.setValue(s.value("default_rows", 40, int))
+        form.addRow("Terminal rows:", rows)
+
+        timeout = QDoubleSpinBox()
+        timeout.setRange(0.5, 5.0)
+        timeout.setSingleStep(0.5)
+        timeout.setSuffix(" s")
+        timeout.setValue(s.value("detection_timeout", 1.5, float))
+        form.addRow("Detection timeout per tool:", timeout)
+
+        installed_first = QCheckBox("Show installed tools before Discover")
+        installed_first.setChecked(s.value("show_installed_first", True, bool))
+        form.addRow("", installed_first)
+
+        confirm_quit = QCheckBox("Confirm before quitting with running tabs")
+        confirm_quit.setChecked(s.value("confirm_quit", True, bool))
+        form.addRow("", confirm_quit)
+
+        # ─── Buttons ─────────────────────────────────────────────────
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel |
+            QDialogButtonBox.StandardButton.RestoreDefaults
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        def restore_defaults():
+            font_size.setValue(12)
+            cols.setValue(120)
+            rows.setValue(40)
+            timeout.setValue(1.5)
+            installed_first.setChecked(True)
+            confirm_quit.setChecked(True)
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(restore_defaults)
+
+        # ─── Layout ──────────────────────────────────────────────────
+        layout = QVBoxLayout(dlg)
+        title = QLabel("<h3>Preferences</h3>")
+        layout.addWidget(title)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Save settings
+        s.setValue("default_font_size", font_size.value())
+        s.setValue("default_cols", cols.value())
+        s.setValue("default_rows", rows.value())
+        s.setValue("detection_timeout", timeout.value())
+        s.setValue("show_installed_first", installed_first.isChecked())
+        s.setValue("confirm_quit", confirm_quit.isChecked())
+
+        self.statusBar().showMessage(
+            "Preferences saved — restart tools or refresh to see font/size changes",
+            4000,
         )
 
     def _show_shortcuts(self):
@@ -1183,15 +1408,24 @@ Click a tool row to launch in the current tab.
             self.terminal.run_in_new_tab(widget.tool.command, category=widget.tool.category)
 
     def _update_title_bar(self):
-        """Show running tab count in title bar."""
+        """Show running tab count in title bar + refresh sidebar running indicators."""
         running = 0
+        running_cmds = set()
         for state in self.terminal._tab_states.values():
             if state.get("state") == "running":
                 running += 1
+                cmd = state.get("command")
+                if cmd:
+                    running_cmds.add(cmd)
         if running > 0:
             self.setWindowTitle(f"TerminalDeck — {running} running")
         else:
             self.setWindowTitle("TerminalDeck")
+        # Update sidebar running indicators (best-effort)
+        try:
+            self.sidebar.update_running_indicators(running_cmds)
+        except Exception:
+            pass
 
     # ─── QSettings persistence ────────────────────────────────────────
     def _restore_session(self):
@@ -1259,9 +1493,20 @@ Click a tool row to launch in the current tab.
             pass
 
     def closeEvent(self, event):
-        """Make sure all PTYReader threads are fully stopped before exit."""
-        # Always use the tabbed terminal's shutdown — it walks every tab
-        # and waits for each PTYReader thread to exit cleanly.
+        """Make sure all PTYReader threads + detection worker are stopped."""
+        # Cancel detection first — stops new subprocesses from spawning.
+        if hasattr(self, "_worker") and self._worker is not None:
+            try:
+                self._worker.cancel()
+            except Exception:
+                pass
+        # Save session before terminal.shutdown() — splitter access
+        # after widget destruction can crash.
+        try:
+            self._save_session()
+        except Exception:
+            pass
+        # Stop all tabs and their reader threads.
         self.terminal.shutdown()
         super().closeEvent(event)
 
