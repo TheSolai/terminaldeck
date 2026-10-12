@@ -48,3 +48,5 @@ tmux-server-*.log
 tmp/
 .tmp/
 .cache/
+# ── Screenshots (dev only, not shipped) ──────────────────────────────
+screenshots/

@@ -450,6 +450,26 @@ class ToolRow(QWidget):
                 }
             """)
             self.version_lbl.setToolTip(self.status.get("path", ""))
+        elif self.status["available"]:
+            # Tool is on PATH but its --version hangs (TUI / REPL). Show
+            # a neutral "TUI" badge so the row doesn't look broken.
+            self.version_lbl.setObjectName("version_tui")
+            self.version_lbl.setText("TUI")
+            self.version_lbl.setStyleSheet("""
+                QLabel {
+                    background-color: #161b22;
+                    color: #79c0ff;
+                    border: 1px solid #30363d;
+                    border-radius: 8px;
+                    padding: 2px 8px;
+                    font-size: 10px;
+                    font-family: 'Menlo', monospace;
+                }
+            """)
+            self.version_lbl.setToolTip(
+                "Installed but its --version hangs (interactive TUI). "
+                "Click to launch."
+            )
         else:
             self.version_lbl.setObjectName("version_missing")
             if self.tool.install:
@@ -1007,8 +1027,11 @@ class MainWindow(QMainWindow):
         display_n = visible if visible != n else n
         suffix = f"  ·  {display_n}/{n}" if visible != n else f"  ·  {n}"
         if section == "discover":
-            cat_title = next((t for k, t in T.DISCOVER_CATEGORIES if k == cat_key), "Discover")
-            self.list_header.setText(f"DISCOVER · {cat_title.upper()}{suffix} TOOLS")
+            if cat_key:
+                cat_title = next((t for k, t in T.DISCOVER_CATEGORIES if k == cat_key), "Discover")
+                self.list_header.setText(f"DISCOVER · {cat_title.upper()}{suffix} TOOLS")
+            else:
+                self.list_header.setText(f"ALL DISCOVER{suffix} TOOLS")
             self.list_header.setStyleSheet("""
                 QLabel {
                     background-color: #1f2d3d;
